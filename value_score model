@@ -1,0 +1,619 @@
+import pandas as pd
+import numpy as np
+import re
+import os
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from webdriver_manager.chrome import ChromeDriverManager
+from scipy.stats import poisson
+
+# Disable SSL certificate verification for webdriver manager
+os.environ['WDM_SSL_VERIFY'] = '0'
+
+# Set Chrome driver options
+chrome_options = Options()
+chrome_options.add_argument('--headless')
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+
+# Initialize Chrome WebDriver
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+
+
+# --- Step 1: Scrape Premier League table ---
+try:
+    driver.get('https://www.bbc.co.uk/sport/football/tables')
+    #css_selector = '#main-content > div > div.ssrcss-1r0zndr-TabWrapper.e1uquauq6 > div'
+    css_selector = '#main-content > div > div.ssrcss-1na7k3u-Tabs.e1vl8fg95'
+    div = driver.find_element(By.CSS_SELECTOR, css_selector)
+    table_div_text = div.text
+except Exception as e:
+    print(f"Error fetching table data: {e}")
+
+# Clean table text
+keywords_to_remove = [
+    'Position', 'Team', 'Played', 'Won Drawn Lost', 'Goals For', 'Goals Against',
+    'Goal Difference', 'Points', 'Form', 'Result Win', 'Result Draw', 'Result Loss',
+    'W', 'D', 'L', 'Last 6 games', 'Oldest first'
+]
+
+def clean_text(text, keywords):
+    pattern = r'\b(' + '|'.join(map(re.escape, keywords)) + r')\b'
+    lines = text.splitlines()
+    cleaned_lines = [line for line in lines if not re.search(pattern, line)]
+    return "\n".join(cleaned_lines)
+
+cleaned_text = clean_text(table_div_text, keywords_to_remove)
+
+pattern = re.compile(
+    r'(\d+)\s([A-Za-z&\s]+?)\s(\d+)\s(\d+)\s(\d+)\s(\d+)\s(\d+)\s(\d+)\s(-?\d+)\s(\d+)'
+)
+matches = pattern.findall(cleaned_text)
+
+table = pd.DataFrame(matches, columns=[
+    "Position", "Team", "Played", "Won", "Drawn", "Lost",
+    "Goals For", "Goals Against", "Goal Difference", "Points"
+])
+
+numeric_cols = [
+    "Position", "Played", "Won", "Drawn", "Lost",
+    "Goals For", "Goals Against", "Goal Difference", "Points"
+]
+table[numeric_cols] = table[numeric_cols].apply(pd.to_numeric)
+
+
+
+# --- Step 2: Scrape fixtures ---
+try:
+    driver.get('https://fpl247.com/live') #https://fpl247.com/live?week-id=11
+    css_selector = 'body > div > div.page-wrapper > div.page-content > div.container-fluid.p-0 > div:nth-child(2) > div > div'
+    div = driver.find_element(By.CSS_SELECTOR, css_selector)
+    fixtures_div_text = div.text
+except Exception as e:
+    print(f"Error fetching fixtures data: {e}")
+
+# Parse fixtures from text
+team_names = re.findall(r'\n([A-Za-z \']+)\n\d{2}:\d{2}\n([A-Za-z \']+)', fixtures_div_text)
+fixtures = pd.DataFrame(team_names, columns=['Home Team', 'Away Team'])
+fixtures.insert(1, 'Home Goals', None)
+fixtures.insert(2, 'Away Goals', None)
+
+# Normalize team names
+team_replacements = {
+    'Spurs': 'Tottenham Hotspur',
+    'West Ham': 'West Ham United',
+    'Leeds': 'Leeds United',
+    'Man Utd': 'Manchester United',
+    'Newcastle': 'Newcastle United',
+    'Brighton': 'Brighton & Hove Albion',
+    'Bournemouth': 'AFC Bournemouth',
+    'Wolves': 'Wolverhampton Wanderers',
+    'Man City': 'Manchester City',
+    "Nott'm Forest": 'Nottingham Forest'
+}
+
+fixtures['Home Team'] = fixtures['Home Team'].replace(team_replacements)
+fixtures['Away Team'] = fixtures['Away Team'].replace(team_replacements)
+
+# Ensure all teams exist in league table
+fixtures = fixtures[
+    fixtures['Home Team'].isin(table['Team']) & fixtures['Away Team'].isin(table['Team'])
+].reset_index(drop=True)
+
+
+
+# --- Step 3: Compute attack and defense strengths ---
+league_avg_goals_for = table['Goals For'].sum() / table['Played'].sum()
+
+table['Attack Strength'] = (table['Goals For'] / table['Played']) / league_avg_goals_for
+table['Defense Strength'] = (table['Goals Against'] / table['Played']) / league_avg_goals_for
+
+
+
+# --- Step 4: Define expected goals (λ values) with home advantage ---
+baseline_home_win_prob = 0.432  # average over last 5 years
+current_home_win_prob = 0.53   # current season - ADJUST EACH WEEK
+
+home_advantage = current_home_win_prob / baseline_home_win_prob
+
+def expected_goals(row):
+    home_team = row['Home Team']
+    away_team = row['Away Team']
+
+    try:
+        home_attack = table.loc[table['Team'] == home_team, 'Attack Strength'].values[0]
+        home_defense = table.loc[table['Team'] == home_team, 'Defense Strength'].values[0]
+        away_attack = table.loc[table['Team'] == away_team, 'Attack Strength'].values[0]
+        away_defense = table.loc[table['Team'] == away_team, 'Defense Strength'].values[0]
+    except IndexError:
+        return np.nan, np.nan
+
+    lambda_home = home_attack * away_defense * league_avg_goals_for * home_advantage
+    lambda_away = away_attack * home_defense * league_avg_goals_for
+
+    return lambda_home, lambda_away
+
+fixtures[['λ_home', 'λ_away']] = fixtures.apply(lambda row: pd.Series(expected_goals(row)), axis=1)
+fixtures = fixtures.round({'λ_home': 2, 'λ_away': 2})
+
+
+
+# --- Step 5: Compute Poisson score probabilities ---
+max_goals = 6  # wider range for realism
+
+def poisson_predictions(row):
+    probs = np.zeros((max_goals + 1, max_goals + 1))
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            probs[i, j] = poisson.pmf(i, row['λ_home']) * poisson.pmf(j, row['λ_away'])
+    return probs
+
+fixtures['Score Matrix'] = fixtures.apply(poisson_predictions, axis=1)
+
+
+
+# --- Step 6: Outcome probabilities ---
+def outcome_probs(prob_matrix):
+    home_win = np.sum(np.tril(prob_matrix, -1))
+    draw = np.sum(np.diag(prob_matrix))
+    away_win = np.sum(np.triu(prob_matrix, 1))
+    return home_win, draw, away_win
+
+fixtures[['Home Win P', 'Draw P', 'Away Win P']] = fixtures['Score Matrix'].apply(
+    lambda m: pd.Series(outcome_probs(m))
+)
+
+# Convert probabilities to percentages
+for col in ['Home Win P', 'Draw P', 'Away Win P']:
+    fixtures[col] = (fixtures[col] * 100).round(2)
+
+
+
+# --- Step 7: Most likely scoreline ---
+def most_likely_score_from_matrix(prob_matrix):
+    i, j = np.unravel_index(np.argmax(prob_matrix), prob_matrix.shape)
+    return f"{i}-{j}"
+
+fixtures['Most Likely Score'] = fixtures['Score Matrix'].apply(most_likely_score_from_matrix)
+
+#driver.quit()
+
+# --- Final Clean Output ---
+fixtures = fixtures[[
+    'Most Likely Score', 'Home Team', 'λ_home', 'λ_away',
+    'Away Team', 'Home Win P', 'Draw P', 'Away Win P'
+]]
+
+# Round the lambda columns to nearest integers as new columns
+fixtures.insert(
+    fixtures.columns.get_loc('λ_home') + 1,
+    'Home',
+    fixtures['λ_home'].round().astype(int)
+)
+fixtures.insert(
+    fixtures.columns.get_loc('λ_away') + 2,  # +2 because one col was inserted before
+    'Away',
+    fixtures['λ_away'].round().astype(int)
+)
+
+# Keep columns in desired order including the new 'Home' and 'Away' columns
+fixtures = fixtures[[
+    'Most Likely Score', 'Home Team', 'λ_home', 'Home',
+    'Away', 'λ_away', 'Away Team', 'Home Win P', 'Draw P', 'Away Win P'
+]]
+
+poisson_df = fixtures.copy()
+poisson_df = poisson_df.sort_values(by='Home Team')
+#poisson_df
+print(poisson_df.to_string(index=False))
+
+
+
+
+
+
+
+
+
+#Odds DF
+
+# Create fixture string column
+fixtures['Fixture'] = fixtures['Home Team'] + ' vs ' + fixtures['Away Team']
+
+# Convert win/draw/away probabilities from % to decimal odds
+def prob_to_odds(pct):
+    prob = pct / 100
+    # Avoid division by zero or too small probabilities
+    return round(1/prob, 2) if prob > 0 else np.nan
+
+odds_df = pd.DataFrame({
+    'Fixture': fixtures['Fixture'],
+    'Home Odds': fixtures['Home Win P'].apply(prob_to_odds),
+    'Draw Odds': fixtures['Draw P'].apply(prob_to_odds),
+    'Away Odds': fixtures['Away Win P'].apply(prob_to_odds),
+})
+
+
+
+
+
+
+
+
+
+#WHill DF
+
+chrome_options = Options()
+# chrome_options.add_argument('--headless')
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+chrome_options.page_load_strategy = 'eager'
+
+def frac_to_decimal(frac_str):
+    try:
+        num, denom = frac_str.split('/')
+        return round(1 + float(num) / float(denom), 2)
+    except Exception:
+        return None
+
+def fix_fixture(fixture):
+    # Replace v with vs
+    new_fixture = fixture.replace(' v ', ' vs ')
+    # Replace Bournemouth with AFC Bournemouth if present as a team
+    teams = new_fixture.split(' vs ')
+    teams = ['AFC Bournemouth' if t.strip() == 'Bournemouth' else t for t in teams]
+    return ' vs '.join(teams)
+
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+driver.get('https://sports.williamhill.com/betting/en-gb/football/competitions/OB_TY295/English-Premier-League/matches/OB_MGMB/Match-Betting')
+
+container_selector = '#main'
+try:
+    wait = WebDriverWait(driver, 20, poll_frequency=1, ignored_exceptions=[TimeoutException])
+    container = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, container_selector)))
+    lines = container.text.splitlines()
+
+    fixtures = []
+    home_odds = []
+    draw_odds = []
+    away_odds = []
+
+    count = 0
+    i = 0
+    while count < 10 and i < len(lines):
+        if ' v ' in lines[i]:
+            fixed_fixture = fix_fixture(lines[i])
+            fixtures.append(fixed_fixture)
+            if i+3 < len(lines):
+                home_odds.append(frac_to_decimal(lines[i+1]))
+                draw_odds.append(frac_to_decimal(lines[i+2]))
+                away_odds.append(frac_to_decimal(lines[i+3]))
+            else:
+                home_odds.append(None)
+                draw_odds.append(None)
+                away_odds.append(None)
+            count += 1
+            i += 4
+        else:
+            i += 1
+
+    # Replace None with 2.0
+    home_odds = [2.0 if x is None else x for x in home_odds]
+    away_odds = [2.0 if x is None else x for x in away_odds]
+    
+    whill_df = pd.DataFrame({
+        'Fixture': fixtures,
+        'Home Odds': home_odds,
+        'Draw Odds': draw_odds,
+        'Away Odds': away_odds
+    })
+
+    #print(whill_df)
+except Exception as e:
+    print(f"ERROR: {e}")
+
+
+
+
+
+
+
+
+
+#Value Bet DF (WHill - Odds)
+
+# --- SAFE VALUE DIFFERENCE CALCULATION BETWEEN ODDS DATAFRAMES ---
+# Sort both DataFrames by 'Fixture' A-Z, then reset index
+odds_df = odds_df.sort_values('Fixture').reset_index(drop=True)
+whill_df = whill_df.sort_values('Fixture').reset_index(drop=True)
+
+# Ensure both DataFrames exist and display their columns/shapes for debugging
+print("odds_df columns:", odds_df.columns)
+print("whill_df columns:", whill_df.columns)
+print("odds_df shape:", odds_df.shape)
+print("whill_df shape:", whill_df.shape)
+
+# If either is empty, abort subtraction (avoids errors)
+if odds_df.empty or whill_df.empty:
+    print("One or both DataFrames are empty, cannot compare odds.")
+    value_df = pd.DataFrame(columns=['Fixture', 'Home Odds', 'Draw Odds', 'Away Odds'])
+else:
+    # Convert columns to float, only if present
+    required_cols = ['Home Odds', 'Draw Odds', 'Away Odds']
+    for col in required_cols:
+        if col in odds_df.columns:
+            odds_df[col] = odds_df[col].astype(float)
+        if col in whill_df.columns:
+            whill_df[col] = whill_df[col].astype(float)
+
+    # Align both DataFrames to first 10 rows
+    odds_comp = odds_df.head(10)[required_cols].reset_index(drop=True)
+    whill_comp = whill_df.head(10)[required_cols].reset_index(drop=True)
+
+    # Subtract model odds from market odds; add fixture info (from whill_df if available, else odds_df)
+    value_diff = whill_comp - odds_comp
+    if 'Fixture' in whill_df.columns:
+        value_diff['Fixture'] = whill_df['Fixture'].head(10).reset_index(drop=True)
+    else:
+        value_diff['Fixture'] = odds_df['Fixture'].head(10).reset_index(drop=True)
+
+    value_df = value_diff[['Fixture', 'Home Odds', 'Draw Odds', 'Away Odds']]
+    value_df = value_df.round(2)
+
+# Copy the 'Fixture' column to start the new dataframe
+value_bet_df = value_df[['Fixture']].copy()
+
+# Compute ranks for the odds columns per row (highest = rank 1)
+ranked_odds = value_df[['Home Odds', 'Draw Odds', 'Away Odds']].rank(
+    axis=1, ascending=False, method='min').astype(int)
+
+# Rename the rank columns
+ranked_odds.columns = ['Home Odds Rank', 'Draw Odds Rank', 'Away Odds Rank']
+
+# Insert the ranked columns into value_bet_df
+for col in ranked_odds.columns:
+    value_bet_df[col] = ranked_odds[col]
+
+print(value_bet_df.to_string(index=False))
+
+
+
+
+high_value = value_df[value_df.iloc[:, 1:4].gt(0.5).any(axis=1)]
+
+
+
+
+#xG DF
+
+#os.environ['WDM_SSL_VERIFY'] = '0'
+#chrome_options = Options()
+#chrome_options.add_argument('--headless')
+#chrome_options.add_argument('--no-sandbox')
+#chrome_options.add_argument('--disable-dev-shm-usage')
+#chrome_options.page_load_strategy = 'eager'
+
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+driver.get('https://footystats.org/england/premier-league/xg')
+
+container_selector = 'ul.ui-list.multiple-stats'
+try:
+    wait = WebDriverWait(driver, 20, poll_frequency=1, ignored_exceptions=[TimeoutException])
+    container = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, container_selector)))
+    lines = container.text.splitlines()
+
+    first_fixture_index = None
+    for idx, line in enumerate(lines):
+        if ' vs ' in line:
+            first_fixture_index = idx
+            break
+
+    data = []
+    i = first_fixture_index
+    while i is not None and i + 2 < len(lines) and len(data) < 10:
+        fixture = lines[i]
+        try:
+            home_xg = float(lines[i + 1])
+            away_xg = float(lines[i + 2])
+            # Split fixture
+            home_team, away_team = [x.strip() for x in fixture.split(' vs ', 1)]
+            data.append([home_team, home_xg, away_xg, away_team])
+            i += 5  # Move to next fixture block
+        except ValueError:
+            i += 1
+
+    xg_df = pd.DataFrame(data, columns=["Home Team", "Home", "Away", "Away Team"])
+    xg_df = xg_df.sort_values(by='Home Team')
+
+except TimeoutException:
+    print("Timeout: Element not found within 20 seconds.")
+
+# Rename columns in xg_df for clarity before merging
+xg_df.rename(columns={"Home": "λ_home", "Away": "λ_away"}, inplace=True)
+
+
+
+
+
+
+
+
+
+#Scores DFs
+
+# Merge poisson_df and xg_df on the Home Team and Away Team columns
+merged_df = pd.merge(poisson_df, xg_df, on=['Home Team', 'Away Team'], suffixes=('_pois', '_xg'))
+
+# Calculate the averages of the Home and Away columns from both dataframes
+merged_df['Home'] = (merged_df['λ_home_pois'] + merged_df['λ_home_xg']) / 2
+merged_df['Away'] = (merged_df['λ_away_pois'] + merged_df['λ_away_xg']) / 2
+
+# Keep the desired columns and round Home and Away to 2 decimal places
+poission_xg_df = merged_df[['Home Team', 'Home', 'Away', 'Away Team']]
+poission_xg_df['Home'] = poission_xg_df['Home'].round(2)
+poission_xg_df['Away'] = poission_xg_df['Away'].round(2)
+
+scores = poission_xg_df.copy()
+scores['Home'] = poission_xg_df['Home'].round(0).astype(int)
+scores['Away'] = poission_xg_df['Away'].round(0).astype(int)
+#scores
+
+scores_poisson = poisson_df[['Home Team', 'Home', 'Away', 'Away Team']].copy()
+#scores_poisson
+
+scores_xg = xg_df[['Home Team', 'λ_home', 'λ_away', 'Away Team']].copy()
+scores_xg['λ_home'] = scores_xg['λ_home'].round(0).astype(int)
+scores_xg['λ_away'] = scores_xg['λ_away'].round(0).astype(int)
+scores_xg.rename(columns={"λ_home": "Home", "λ_away": "Away"}, inplace=True)
+print(scores_xg.to_string(index=False))
+
+
+
+
+
+
+
+
+
+#Strategies
+
+#1 VALUE & PROB
+
+# Define the column groups
+rank_cols = ['Home Odds', 'Draw Odds', 'Away Odds']
+prob_cols = ['Home Win P', 'Draw P', 'Away Win P']
+
+# Create a mapping between rank column and corresponding prob column
+col_map = {
+    'Home Odds': 'Home Win P',
+    'Draw Odds': 'Draw P',
+    'Away Odds': 'Away Win P'
+}
+
+# For each row in value_df, find which of the rank columns has the highest value
+highest_rank_col = value_df[rank_cols].idxmax(axis=1).reset_index(drop=True)
+
+# For each corresponding row in poisson_df, find which of the prob columns has the highest value
+highest_prob_col = poisson_df[prob_cols].idxmax(axis=1).reset_index(drop=True)
+
+# Now select rows where the highest rank column corresponds to the highest prob column via mapping
+mask = highest_rank_col.map(col_map) == highest_prob_col
+
+# Filter value_df rows using the mask by position since mask is reset index
+strategy_valueandprob = value_df.loc[mask.index[mask]].copy()
+print(strategy_valueandprob.to_string(index=False))
+
+
+
+#2, #3 PROB
+
+prob_cols = ['Home Win P', 'Draw P', 'Away Win P']
+
+def winner_label(row):
+    max_col = row[prob_cols].idxmax()
+    if max_col == 'Home Win P':
+        return row['Home Team']
+    elif max_col == 'Away Win P':
+        return row['Away Team']
+    else:
+        return 'Draw'
+
+# Build favourites column row-wise with .apply
+favourites = poisson_df.apply(winner_label, axis=1)
+
+# Create the result DataFrame
+strategy_prob = pd.DataFrame({
+    'Winner': favourites,
+    'Win Probability': poisson_df[prob_cols].max(axis=1)
+})
+print(strategy_prob)
+
+strategy_prob['Win Probability'] = round(strategy_prob['Win Probability'] / 100, 2)
+product_prob = strategy_prob['Win Probability'].prod()
+strategy_prob_win = round(product_prob, 3)
+strategy_prob_odds = 1/strategy_prob_win
+
+strategy_prob_win = f"{product_prob:.2%}"
+print(strategy_prob_win)
+
+
+
+#4, #5 VALUE
+
+# Create copy
+value_bet_df_new = value_bet_df.copy()
+
+# Split 'Fixture' column into two columns 'Home Team' and 'Away Team'
+value_bet_df_new[['Home Team', 'Away Team']] = value_bet_df_new['Fixture'].str.split(' vs ', expand=True)
+
+# Drop the original 'Fixture' column
+value_bet_df_new = value_bet_df_new.drop(columns=['Fixture'])
+
+# Get list of all columns except 'Home Team' and 'Away Team'
+cols = [col for col in value_bet_df_new.columns if col not in ['Home Team', 'Away Team']]
+
+# Reorder columns: 'Home Team' first, then middle columns, then 'Away Team' last
+value_bet_df_new = value_bet_df_new[['Home Team'] + cols + ['Away Team']]
+
+
+value_cols = ['Home Odds Rank', 'Draw Odds Rank', 'Away Odds Rank']
+
+def best_value(row):
+    min_col = row[value_cols].idxmin()
+    if min_col == 'Home Odds Rank':
+        return row['Home Team']
+    elif min_col == 'Away Odds Rank':
+        return row['Away Team']
+    else:
+        return 'Draw'
+
+# Build favourites column row-wise with .apply
+value_picks = value_bet_df_new.apply(best_value, axis=1)
+
+# Create the result DataFrame
+strategy_value = pd.DataFrame({
+    'Value Pick': value_picks
+#find way to insert win prob here
+}).reset_index(drop=True)
+
+print(strategy_value.to_string(index=False))
+
+
+
+
+
+
+
+
+#ADD HOME VS AWAY COEFFICIEINT PER TEAM FOR HOME/AWAY ADVANTAGE
+#ADD HOME/AWAY FORM FOR MORE ACCURATE LAMBDA
+
+'''
+ACCA RESULTS:
+1) VALUE & PROB > 83.33%, 50% (1)
+2) SATURDAY PROB > 50%, 71% (3)
+4) SUNDAY/MONDAY PROB > 80%, 50% (2)
+3) SATURDAY VALUE > 50%, 57% (4)
+5) SUNDAY/MONDAY VALUE > 80%, 0% (5)
+'''
+
+
+
+'''ACCA MODEL SCORES: track xg vs poisson vs scores, 1 point for each correct 1x2'''
+
+#scores_xg > 4 (+6? wait for email response to asus)
+#scores_poisson > 11 (+6)
+#scores > 5 (+6? wait for email response to asus)
+
+
+
+'''SUPERBRU SCORES: track most likely score vs xg vs poisson'''
+#most likely score > 12
+#scores_xg > (19.5?)
+#scores_poisson > 19.5
