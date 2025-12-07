@@ -593,27 +593,3 @@ print(strategy_value.to_string(index=False))
 
 #ADD HOME VS AWAY COEFFICIEINT PER TEAM FOR HOME/AWAY ADVANTAGE
 #ADD HOME/AWAY FORM FOR MORE ACCURATE LAMBDA
-
-'''
-ACCA RESULTS:
-1) VALUE & PROB > 83.33%, 50% (1)
-2) SATURDAY PROB > 50%, 71% (3)
-4) SUNDAY/MONDAY PROB > 80%, 50% (2)
-3) SATURDAY VALUE > 50%, 57% (4)
-5) SUNDAY/MONDAY VALUE > 80%, 0% (5)
-'''
-
-
-
-'''ACCA MODEL SCORES: track xg vs poisson vs scores, 1 point for each correct 1x2'''
-
-#scores_xg > 4 (+6? wait for email response to asus)
-#scores_poisson > 11 (+6)
-#scores > 5 (+6? wait for email response to asus)
-
-
-
-'''SUPERBRU SCORES: track most likely score vs xg vs poisson'''
-#most likely score > 12
-#scores_xg > (19.5?)
-#scores_poisson > 19.5
